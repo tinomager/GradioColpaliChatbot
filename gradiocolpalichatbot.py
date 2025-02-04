@@ -14,7 +14,6 @@ from openai import AzureOpenAI
 import base64
 from datetime import datetime
 import glob
-
 from azure.search.documents.indexes import SearchIndexClient
 from azure.search.documents.indexes.models import (
     SimpleField,
@@ -29,111 +28,127 @@ from azure.search.documents.indexes.models import (
 from azure.search.documents import SearchClient
 from azure.search.documents.models import VectorizedQuery
 from azure.core.credentials import AzureKeyCredential
-
 import os
 from dotenv import load_dotenv
+
 load_dotenv()
 SEARCH_KEY = os.getenv("SEARCH_KEY")
 SEARCH_ENDPOINT = os.getenv("SEARCH_ENDPOINT")
 INDEX_NAME = os.getenv("INDEX_NAME")
 LOGGING = os.getenv("LOGGING").lower() == "true"
 
-client = AzureOpenAI(api_key=os.environ['AZURE_OPENAI_API_KEY'],
-                    azure_endpoint=os.environ['AZURE_OPENAI_ENDPOINT'],
-                    api_version=os.environ['OPENAI_API_VERSION'])
+class AzureClient:
+    def __init__(self):
+        self._client = None
 
-credential = AzureKeyCredential(SEARCH_KEY)
-search_client = SearchClient(
-    SEARCH_ENDPOINT,
-    index_name=INDEX_NAME,
-    credential=credential,
-)
+    def get_client(self):
+        if self._client is None:
+            self._client = AzureOpenAI(api_key=os.environ['AZURE_OPENAI_API_KEY'],
+                                       azure_endpoint=os.environ['AZURE_OPENAI_ENDPOINT'],
+                                       api_version=os.environ['OPENAI_API_VERSION'])
+        return self._client
 
-def scale_image(image, max_width):
-    # Example scaling logic
-    w, h = image.size
-    if w > max_width:
-        ratio = max_width / float(w)
-        new_h = int(h * ratio)
-        return image.resize((max_width, new_h))
-    return image
+class SearchClientWrapper:
+    def __init__(self, endpoint, key, index_name):
+        self.credential = AzureKeyCredential(key)
+        self.search_client = SearchClient(endpoint, index_name=index_name, credential=self.credential)
+        self.index_client = SearchIndexClient(endpoint=endpoint, credential=self.credential)
 
-def get_base64_image(image, add_url_prefix=False):
-    buffer = BytesIO()
-    image.save(buffer, format="PNG")
-    img_str = base64.b64encode(buffer.getvalue()).decode("utf-8")
-    if add_url_prefix:
-        return "data:image/png;base64," + img_str
-    return img_str
+    def index_exists(self, index_name):
+        return any(index.name == index_name for index in self.index_client.list_indexes())
 
-if torch.cuda.is_available():
-    device = torch.device("cuda")
-    if torch.cuda.is_bf16_supported():
-        type = torch.bfloat16
-elif torch.backends.mps.is_available():
-    device = torch.device("mps")
-    type = torch.float32
-else:
-    device = torch.device("cpu")
-    type = torch.float32
+    def create_or_update_index(self, index):
+        return self.index_client.create_or_update_index(index)
 
-model_name = "vidore/colpali-v1.2"
-model = ColPali.from_pretrained("vidore/colpaligemma-3b-pt-448-base", torch_dtype=type).eval()
-model.load_adapter(model_name)
-model = model.eval()
-model.to(device)
-professor = ColPaliProcessor.from_pretrained(model_name)
+    def upload_documents(self, documents):
+        self.search_client.upload_documents(documents=documents)
 
-def get_pdf_images(pdf_path):
-    reader = PdfReader(pdf_path)
-    page_texts = []
-    for page_number in range(len(reader.pages)):
-        page = reader.pages[page_number]
-        text = page.extract_text()
-        page_texts.append(text)
-    images = convert_from_path(pdf_path)
-    assert len(images) == len(page_texts)
-    return (images, page_texts)
+    def search(self, vector_query):
+        if vector_query is None:
+            return list(self.search_client.search(search_text=None))
+        return list(self.search_client.search(search_text=None, vector_queries=[vector_query]))
 
-def create_pdf_search_index_and_upload_documents(endpoint: str, key: str, index_name: str) -> SearchIndex:
-    # Initialize the search index client
-    credential = AzureKeyCredential(key)
-    index_client = SearchIndexClient(endpoint=endpoint, credential=credential)
-    index_search_client = SearchClient(
-        SEARCH_ENDPOINT,
-        index_name=INDEX_NAME,
-        credential=credential,
-    )
+class PDFProcessor:
+    def __init__(self):
+        pass
 
-    index_exists = any(index.name == index_name for index in index_client.list_indexes())
-    if index_exists:
-        results = index_search_client.search(search_text=None, filter=None, top=5000)
-        results = list(results)
-        log_query_results("Whole search index", results)
-        return index_client.get_index(index_name)
-    
-    all_pdfs = read_pdfs()
-    
-    for pdf in all_pdfs:
-        page_images, page_texts = get_pdf_images(pdf['url'])
-        pdf['images'] = page_images
-        pdf['texts'] = page_texts
+    @staticmethod
+    def get_pdf_images(pdf_path):
+        reader = PdfReader(pdf_path)
+        page_texts = [page.extract_text() for page in reader.pages]
+        images = convert_from_path(pdf_path)
+        assert len(images) == len(page_texts)
+        return images, page_texts
 
+    @staticmethod
+    def read_pdfs(subfolder="docs"):
+        file_names = glob.glob(os.path.join(subfolder, "**", "*.pdf"), recursive=True)
+        return [{"title": os.path.basename(filename), "url": filename} for filename in file_names]
+
+class ImageProcessor:
+    def __init__(self):
+        pass
+
+    @staticmethod
+    def scale_image(image, max_width):
+        w, h = image.size
+        if w > max_width:
+            ratio = max_width / float(w)
+            new_h = int(h * ratio)
+            return image.resize((max_width, new_h))
+        return image
+
+    @staticmethod
+    def get_base64_image(image, add_url_prefix=False):
+        buffer = BytesIO()
+        image.save(buffer, format="PNG")
+        img_str = base64.b64encode(buffer.getvalue()).decode("utf-8")
+        return "data:image/png;base64," + img_str if add_url_prefix else img_str
+
+class ModelWrapper:
+    def __init__(self, model_name, device, dtype):
+        self.model = ColPali.from_pretrained("vidore/colpaligemma-3b-pt-448-base", torch_dtype=dtype).eval()
+        self.model.load_adapter(model_name)
+        self.model = self.model.eval().to(device)
+        self.processor = ColPaliProcessor.from_pretrained(model_name)
+
+    def process_images(self, images):
+        return self.processor.process_images(images)
+
+    def get_embeddings(self, inputs):
+        with torch.no_grad():
+            return self.model(**inputs)
+
+class PDFIndexer:
+    def __init__(self, search_client, model_wrapper, image_processor):
+        self.search_client = search_client
+        self.model_wrapper = model_wrapper
+        self.image_processor = image_processor
+
+    def create_pdf_search_index_and_upload_documents(self, index_name):
+        if self.search_client.index_exists(index_name):
+            results = self.search_client.search(vector_query=None)
+            self.log_query_results("Whole search index", results)
+            return self.search_client.index_client.get_index(index_name)
+
+        all_pdfs = PDFProcessor.read_pdfs()
         for pdf in all_pdfs:
+            page_images, page_texts = PDFProcessor.get_pdf_images(pdf['url'])
+            pdf['images'] = page_images
+            pdf['texts'] = page_texts
+
             page_embeddings = []
             dataloader = DataLoader(
-                    pdf['images'],
-                    batch_size=2,
-                    shuffle=False,
-                    collate_fn=lambda x: professor.process_images(x),
-                )
+                pdf['images'],
+                batch_size=2,
+                shuffle=False,
+                collate_fn=lambda x: self.model_wrapper.process_images(x),
+            )
             for batch_doc in tqdm(dataloader):
-                with torch.no_grad():
-                    batch_doc = {k: v.to(model.device) for k, v in batch_doc.items()}
-                    embeddings = model(**batch_doc)
-                    mean_embedding = torch.mean(embeddings, dim=1).float().cpu().numpy()
-                    #page_embeddings.extend(list(torch.unbind(embeddings.to("cpu"))))
-                    page_embeddings.extend(mean_embedding)
+                batch_doc = {k: v.to(self.model_wrapper.model.device) for k, v in batch_doc.items()}
+                embeddings = self.model_wrapper.get_embeddings(batch_doc)
+                mean_embedding = torch.mean(embeddings, dim=1).float().cpu().numpy()
+                page_embeddings.extend(mean_embedding)
             pdf['embeddings'] = page_embeddings
 
         lst_feed = []
@@ -141,7 +156,7 @@ def create_pdf_search_index_and_upload_documents(endpoint: str, key: str, index_
             url = pdf['url']
             title = pdf['title']
             for page_number, (page_text, embedding, image) in enumerate(zip(pdf['texts'], pdf['embeddings'], pdf['images'])):
-                base_64_image = get_base64_image(scale_image(image,640),add_url_prefix=False)   
+                base_64_image = self.image_processor.get_base64_image(self.image_processor.scale_image(image, 640), add_url_prefix=False)
                 page = {
                     "id": str(hash(url + str(page_number))),
                     "url": url,
@@ -153,14 +168,13 @@ def create_pdf_search_index_and_upload_documents(endpoint: str, key: str, index_
                 }
                 lst_feed.append(page)
 
-    # Define vector search configuration
-    vector_search = VectorSearch(
+        vector_search = VectorSearch(
             algorithms=[
                 HnswAlgorithmConfiguration(
                     name="myHnsw",
                     parameters={
-                        "m": 4,  # Default HNSW parameter
-                        "efConstruction": 400,  # Default HNSW parameter
+                        "m": 4,
+                        "efConstruction": 400,
                         "metric": "cosine"
                     }
                 )
@@ -172,183 +186,147 @@ def create_pdf_search_index_and_upload_documents(endpoint: str, key: str, index_
                     vectorizer="myVectorizer"
                 )
             ]
-    )
+        )
 
-    # Define the fields
-    fields = [
-            SimpleField(
-                name="id",
-                type=SearchFieldDataType.String,
-                key=True,
-                filterable=True
-            ),
-            SimpleField(
-                name="url",
-                type=SearchFieldDataType.String,
-                filterable=True
-            ),
-            SearchableField(
-                name="title",
-                type=SearchFieldDataType.String,
-                searchable=True,
-                retrievable=True
-            ),
-            SimpleField(
-                name="page_number",
-                type=SearchFieldDataType.Int32,
-                filterable=True,
-                sortable=True
-            ),
-            SimpleField(
-                name="image",
-                type=SearchFieldDataType.String,
-                retrievable=True
-            ),
-            SearchableField(
-                name="text",
-                type=SearchFieldDataType.String,
-                searchable=True,
-                retrievable=True
-            ),
-            SearchField(
-                name="embedding",
-                type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
-                searchable=True,
-                vector_search_dimensions=128,
-                vector_search_profile_name="myHnswProfile"
-            )
+        fields = [
+            SimpleField(name="id", type=SearchFieldDataType.String, key=True, filterable=True),
+            SimpleField(name="url", type=SearchFieldDataType.String, filterable=True),
+            SearchableField(name="title", type=SearchFieldDataType.String, searchable=True, retrievable=True),
+            SimpleField(name="page_number", type=SearchFieldDataType.Int32, filterable=True, sortable=True),
+            SimpleField(name="image", type=SearchFieldDataType.String, retrievable=True),
+            SearchableField(name="text", type=SearchFieldDataType.String, searchable=True, retrievable=True),
+            SearchField(name="embedding", type=SearchFieldDataType.Collection(SearchFieldDataType.Single), searchable=True, vector_search_dimensions=128, vector_search_profile_name="myHnswProfile")
         ]
 
-    # Create the index definition
-    index = SearchIndex(
-        name=index_name,
-        fields=fields,
-        vector_search=vector_search
-    )
+        index = SearchIndex(name=index_name, fields=fields, vector_search=vector_search)
+        result = self.search_client.create_or_update_index(index)
+        self.search_client.upload_documents(documents=lst_feed)
+        return result
 
-    # Create the index in Azure Cognitive Search
-    result = index_client.create_or_update_index(index)
-    #add all documents to the index
-    search_client = SearchClient(endpoint=endpoint, credential=credential, index_name=index_name)
-    search_client.upload_documents(documents=lst_feed)
-    return result
+    def log_query_results(self, query, response):
+        if not LOGGING:
+            return
 
+        html_content = f"<h3>Query text: '{query}', top results:</h3>"
+        for i, hit in enumerate(response):
+            title = hit["title"]
+            url = hit["url"]
+            page = hit["page_number"]
+            image = hit["image"]
+            score = hit["@search.score"]
 
+            html_content += f"<h4>PDF Result {i + 1}</h4>"
+            html_content += f'<p><strong>Title:</strong> <a href="{url}">{title}</a>, page {page+1} with score {score:.2f}</p>'
+            html_content += f'<img src="data:image/png;base64,{image}" style="max-width:100%;">'
 
-def read_pdfs():
-    all_pdfs=[]
-    subfolder = "docs"
-    file_names = glob.glob(os.path.join(subfolder, "**", "*.pdf"), recursive=True)
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        with open(f"logs/query_results_{timestamp}.html", "w") as f:
+            f.write(html_content)
 
-    for filename in file_names:
-        all_pdfs.append(
+class Chatbot:
+    def __init__(self, azure_client, search_client, model_wrapper, image_processor):
+        self.azure_client = azure_client
+        self.search_client = search_client
+        self.model_wrapper = model_wrapper
+        self.image_processor = image_processor
+
+    def process_query(self, query):
+        mock_image = Image.new('RGB', (224, 224), color='white')
+        inputs = self.model_wrapper.processor(text=query, images=mock_image, return_tensors="pt")
+        inputs = {k: v.to(self.model_wrapper.model.device) for k, v in inputs.items()}
+        embeddings = self.model_wrapper.get_embeddings(inputs)
+        return torch.mean(embeddings, dim=1).float().cpu().numpy().tolist()[0]
+
+    def chat_and_update_images(self, message, history, image1, image2, image3):
+        vector_query = VectorizedQuery(
+            vector=self.process_query(message),
+            k_nearest_neighbors=5,
+            fields="embedding",
+        )
+        results = self.search_client.search(vector_query)
+        self.log_query_results(message, results)
+
+        message_object = [
             {
-                "title": os.path.basename(filename),
-                "url": filename
+                "role": "system",
+                "content": """You are an assistant for question-answering tasks. Use the following pieces of retrieved context to answer the question. If you don't know the answer, just say that you don't know. Use three sentences maximum and keep the answer concise.You will be given a mixed of text, tables, and image(s) usually of charts or graphs."""
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": message},
+                    *map(lambda x: {"type": "image_url", "image_url": {"url": f'data:image/jpg;base64,{x["image"]}', "detail": "low"}}, results),
+                ],
             }
-        )
-    return all_pdfs
+        ]
 
-
-def process_query(query: str, processor: AutoProcessor, model: ColPali) -> np.ndarray:
-    mock_image = Image.new('RGB', (224, 224), color='white')
-
-    inputs = processor(text=query, images=mock_image, return_tensors="pt")
-    inputs = {k: v.to(model.device) for k, v in inputs.items()}
-
-    with torch.no_grad():
-        embeddings = model(**inputs)
-
-    return torch.mean(embeddings, dim=1).float().cpu().numpy().tolist()[0]
-
-
-
-def log_query_results(query, response):
-    if not LOGGING:
-        return
-
-    html_content = f"<h3>Query text: '{query}', top results:</h3>"
-
-    for i, hit in enumerate(response):
-        title = hit["title"]
-        url = hit["url"]
-        page = hit["page_number"]
-        image = hit["image"]
-        score = hit["@search.score"]
-
-        html_content += f"<h4>PDF Result {i + 1}</h4>"
-        html_content += f'<p><strong>Title:</strong> <a href="{url}">{title}</a>, page {page+1} with score {score:.2f}</p>'
-        html_content += (
-            f'<img src="data:image/png;base64,{image}" style="max-width:100%;">'
+        response = self.azure_client.get_client().chat.completions.create(
+            model="gpt-4o",
+            messages=message_object,
+            max_tokens=4096,
         )
 
-    #display(HTML(html_content))
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    with open(f"logs/query_results_{timestamp}.html", "w") as f:
-        f.write(html_content)
+        ai_response = response.choices[0].message.content
+        history.append((message, ai_response))
 
-def chat_and_update_images(message, history, image1, image2, image3):
-    # Hier Ihre Chatbot-Logik implementieren
-    vector_query = VectorizedQuery(
-        vector=process_query(message, professor, model),
-        k_nearest_neighbors=5,
-        fields="embedding",
-    )
-    results = search_client.search(search_text=None, vector_queries=[vector_query])
-    results = list(results)
-    log_query_results(message, results)
+        image_paths = [f"images/image{i+1}.png" for i in range(len(results))]
+        for image in image_paths:
+            if os.path.exists(image):
+                os.remove(image)
 
-    message_object = [
-        {
-            "role": "system",
-            "content": """You are an assistant for question-answering tasks. Use the following pieces of retrieved context to answer the question. If you don't know the answer, just say that you don't know. Use three sentences maximum and keep the answer concise.You will be given a mixed of text, tables, and image(s) usually of charts or graphs."""
-        },
-        {
-        "role": "user",
-        "content": [
-            {"type": "text", "text": message},
-            *map(lambda x: {"type": "image_url", "image_url": {"url": f'data:image/jpg;base64,{x["image"]}', "detail": "low"}}, results),
-        ],
-        }
-    ]
+        for i, result in enumerate(results):
+            image_data = base64.b64decode(result["image"])
+            with open(image_paths[i], "wb") as f:
+                f.write(image_data)
 
-    response = client.chat.completions.create(
-    model="gpt-4o",
-    messages=message_object,
-    max_tokens=4096,
-    )
+        return history, image_paths[0], image_paths[1], image_paths[2]
 
-    ai_response = response.choices[0].message.content
-    history.append((message, ai_response))
-    
-    # Beispiel für Bildaktualisierung (ersetzen Sie dies durch Ihre eigene Logik)
-    image_paths = [f"images/image{i+1}.png" for i in range(len(results))]
+    def log_query_results(self, query, response):
+        if not LOGGING:
+            return
 
-    # Remove the old images first
-    for image in image_paths:
-        if os.path.exists(image):
-            os.remove(image)
+        html_content = f"<h3>Query text: '{query}', top results:</h3>"
+        for i, hit in enumerate(response):
+            title = hit["title"]
+            url = hit["url"]
+            page = hit["page_number"]
+            image = hit["image"]
+            score = hit["@search.score"]
 
-    for i, result in enumerate(results):
-        image_data = base64.b64decode(result["image"])
-        with open(image_paths[i], "wb") as f:
-            f.write(image_data)
-    
-    return history, image_paths[0], image_paths[1], image_paths[2]
+            html_content += f"<h4>PDF Result {i + 1}</h4>"
+            html_content += f'<p><strong>Title:</strong> <a href="{url}">{title}</a>, page {page+1} with score {score:.2f}</p>'
+            html_content += f'<img src="data:image/png;base64,{image}" style="max-width:100%;">'
 
-with gr.Blocks() as demo:
-    chatbot = gr.Chatbot()
-    msg = gr.Textbox()
-    clear = gr.ClearButton([msg, chatbot])
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        with open(f"logs/query_results_{timestamp}.html", "w") as f:
+            f.write(html_content)
 
-    with gr.Row():
-        image1 = gr.Image(interactive=False, show_download_button=True)
-        image2 = gr.Image(interactive=False, show_download_button=True)
-        image3 = gr.Image(interactive=False, show_download_button=True)
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+    dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32
 
-    msg.submit(chat_and_update_images, 
-               [msg, chatbot, image1, image2, image3], 
-               [chatbot, image1, image2, image3])
+    azure_client = AzureClient()
+    search_client = SearchClientWrapper(SEARCH_ENDPOINT, SEARCH_KEY, INDEX_NAME)
+    model_wrapper = ModelWrapper("vidore/colpali-v1.2", device, dtype)
+    image_processor = ImageProcessor()
+    pdf_indexer = PDFIndexer(search_client, model_wrapper, image_processor)
+    chatbot = Chatbot(azure_client, search_client, model_wrapper, image_processor)
 
-create_pdf_search_index_and_upload_documents(SEARCH_ENDPOINT, SEARCH_KEY, INDEX_NAME)
-demo.launch()
+    pdf_indexer.create_pdf_search_index_and_upload_documents(INDEX_NAME)
+
+    with gr.Blocks() as demo:
+        chatbot_ui = gr.Chatbot()
+        msg = gr.Textbox()
+        clear = gr.ClearButton([msg, chatbot_ui])
+
+        with gr.Row():
+            image1 = gr.Image(interactive=False, show_download_button=True)
+            image2 = gr.Image(interactive=False, show_download_button=True)
+            image3 = gr.Image(interactive=False, show_download_button=True)
+
+        msg.submit(chatbot.chat_and_update_images, [msg, chatbot_ui, image1, image2, image3], [chatbot_ui, image1, image2, image3])
+
+    demo.launch()
+
+if __name__ == "__main__":
+    main()
