@@ -2,7 +2,6 @@ import gradio as gr
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoProcessor
 from PIL import Image
 from io import BytesIO
 from colpali_engine.models.paligemma import ColPali
@@ -36,6 +35,7 @@ SEARCH_KEY = os.getenv("SEARCH_KEY")
 SEARCH_ENDPOINT = os.getenv("SEARCH_ENDPOINT")
 INDEX_NAME = os.getenv("INDEX_NAME")
 LOGGING = os.getenv("LOGGING").lower() == "true"
+LOG_INDEX = os.getenv("LOG_INDEX").lower() == "true"
 
 class AzureClient:
     def __init__(self):
@@ -54,6 +54,9 @@ class SearchClientWrapper:
         self.search_client = SearchClient(endpoint, index_name=index_name, credential=self.credential)
         self.index_client = SearchIndexClient(endpoint=endpoint, credential=self.credential)
 
+    def get_index(self, index_name):
+        return self.index_client.get_index(index_name)
+
     def index_exists(self, index_name):
         return any(index.name == index_name for index in self.index_client.list_indexes())
 
@@ -61,7 +64,15 @@ class SearchClientWrapper:
         return self.index_client.create_or_update_index(index)
 
     def upload_documents(self, documents):
-        self.search_client.upload_documents(documents=documents)
+        if len(documents) > 50:
+            for(batch) in self.batch_documents(documents, 50):
+                self.search_client.upload_documents(documents=batch)
+        else:
+            self.search_client.upload_documents(documents=documents)
+
+    def batch_documents(self, documents, batch_size):
+        for i in range(0, len(documents), batch_size):
+            yield documents[i:i + batch_size]
 
     def search(self, vector_query):
         if vector_query is None:
@@ -127,9 +138,10 @@ class PDFIndexer:
 
     def create_pdf_search_index_and_upload_documents(self, index_name):
         if self.search_client.index_exists(index_name):
-            results = self.search_client.search(vector_query=None)
-            self.log_query_results("Whole search index", results)
-            return self.search_client.index_client.get_index(index_name)
+            if LOG_INDEX:
+                results = self.search_client.search(None)
+                self.log_query_results("Whole search index", results)
+            return self.search_client.get_index(index_name)
 
         all_pdfs = PDFProcessor.read_pdfs()
         for pdf in all_pdfs:
@@ -237,7 +249,7 @@ class Chatbot:
         embeddings = self.model_wrapper.get_embeddings(inputs)
         return torch.mean(embeddings, dim=1).float().cpu().numpy().tolist()[0]
 
-    def chat_and_update_images(self, message, history, image1, image2, image3):
+    def chat_and_update_images(self, message, history, image1, image2, image3, image4, image5):
         vector_query = VectorizedQuery(
             vector=self.process_query(message),
             k_nearest_neighbors=5,
@@ -279,7 +291,7 @@ class Chatbot:
             with open(image_paths[i], "wb") as f:
                 f.write(image_data)
 
-        return history, image_paths[0], image_paths[1], image_paths[2]
+        return history, image_paths[0], image_paths[1], image_paths[2], image_paths[3], image_paths[4]
 
     def log_query_results(self, query, response):
         if not LOGGING:
@@ -323,8 +335,10 @@ def main():
             image1 = gr.Image(interactive=False, show_download_button=True)
             image2 = gr.Image(interactive=False, show_download_button=True)
             image3 = gr.Image(interactive=False, show_download_button=True)
+            image4 = gr.Image(interactive=False, show_download_button=True)
+            image5 = gr.Image(interactive=False, show_download_button=True)
 
-        msg.submit(chatbot.chat_and_update_images, [msg, chatbot_ui, image1, image2, image3], [chatbot_ui, image1, image2, image3])
+        msg.submit(chatbot.chat_and_update_images, [msg, chatbot_ui, image1, image2, image3, image4, image5], [chatbot_ui, image1, image2, image3, image4, image5])
 
     demo.launch()
 
