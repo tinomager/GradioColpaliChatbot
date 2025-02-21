@@ -39,6 +39,25 @@ GradioColpaliChatbot is an AI-powered chatbot that leverages Gradio for the user
     cp sample.env .env
     ```
 
+## Configuration
+
+## Configuration Parameters
+
+The following environment variables need to be set in the `.env` file for the GradioColpaliChatbot to function correctly. Use the `sample.env` file as a starting point for configuration and copy the file as `.env` and fill in your specific configuration:
+
+- `AZURE_OPENAI_API_KEY`: The API key for accessing Azure OpenAI services.
+- `AZURE_OPENAI_ENDPOINT`: The endpoint URL for Azure OpenAI services.
+- `OPENAI_API_VERSION`: The version of the OpenAI API to use (default is `2024-08-01-preview`).
+- `SEARCH_KEY`: The API key for accessing the Azure Search service.
+- `SEARCH_ENDPOINT`: The endpoint URL for the Azure Search service.
+- `INDEX_NAME`: The name of the search index to use.
+- `LOGGING`: A boolean flag (`True` or `False`) to enable or disable logging.
+- `LOG_INDEX`: A boolean flag (`True` or `False`) to enable or disable logging of the search index.
+- `OPENAI_ENDPOINT`: The endpoint URL for the local OpenAI service.
+- `OPENAI_API_KEY`: The API key for accessing the local OpenAI service.
+- `MODEL_NAME`: The name of the AI model to use (e.g., `gpt-4o` or an Ollama models name).
+- `USE_AZURE`: A boolean flag (`True` or `False`) to specify whether to use Azure services for the large language model hosting.
+
 ## Usage
 
 1. Run the chatbot:
