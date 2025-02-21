@@ -9,7 +9,7 @@ from colpali_engine.models.paligemma import ColPaliProcessor
 from pdf2image import convert_from_path
 from pypdf import PdfReader
 import numpy as np
-from openai import AzureOpenAI
+from openai import AzureOpenAI, OpenAI
 import base64
 from datetime import datetime
 import glob
@@ -37,16 +37,25 @@ INDEX_NAME = os.getenv("INDEX_NAME")
 LOGGING = os.getenv("LOGGING").lower() == "true"
 LOG_INDEX = os.getenv("LOG_INDEX").lower() == "true"
 
-class AzureClient:
+class LlmClient:
     def __init__(self):
+        self._use_azure = os.getenv("USE_AZURE").lower() == "true"
         self._client = None
+        self._model_name = os.getenv("MODEL_NAME")
 
     def get_client(self):
         if self._client is None:
-            self._client = AzureOpenAI(api_key=os.environ['AZURE_OPENAI_API_KEY'],
+            if self._use_azure:
+                self._client = AzureOpenAI(api_key=os.environ['AZURE_OPENAI_API_KEY'],
                                        azure_endpoint=os.environ['AZURE_OPENAI_ENDPOINT'],
                                        api_version=os.environ['OPENAI_API_VERSION'])
+            else:
+                self._client = OpenAI(api_key=os.environ['OPENAI_API_KEY'],
+                                      base_url=os.environ['OPENAI_ENDPOINT'])
         return self._client
+    
+    def get_model(self):
+        return self._model_name
 
 class SearchClientWrapper:
     def __init__(self, endpoint, key, index_name):
@@ -236,8 +245,8 @@ class PDFIndexer:
             f.write(html_content)
 
 class Chatbot:
-    def __init__(self, azure_client, search_client, model_wrapper, image_processor):
-        self.azure_client = azure_client
+    def __init__(self, llm_client, search_client, model_wrapper, image_processor):
+        self.llm_client = llm_client
         self.search_client = search_client
         self.model_wrapper = model_wrapper
         self.image_processor = image_processor
@@ -272,8 +281,8 @@ class Chatbot:
             }
         ]
 
-        response = self.azure_client.get_client().chat.completions.create(
-            model="gpt-4o",
+        response = self.llm_client.get_client().chat.completions.create(
+            model=self.llm_client.get_model(),
             messages=message_object,
             max_tokens=4096,
         )
@@ -317,12 +326,12 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32
 
-    azure_client = AzureClient()
+    llm_client = LlmClient()
     search_client = SearchClientWrapper(SEARCH_ENDPOINT, SEARCH_KEY, INDEX_NAME)
     model_wrapper = ModelWrapper("vidore/colpali-v1.2", device, dtype)
     image_processor = ImageProcessor()
     pdf_indexer = PDFIndexer(search_client, model_wrapper, image_processor)
-    chatbot = Chatbot(azure_client, search_client, model_wrapper, image_processor)
+    chatbot = Chatbot(llm_client, search_client, model_wrapper, image_processor)
 
     pdf_indexer.create_pdf_search_index_and_upload_documents(INDEX_NAME)
 
